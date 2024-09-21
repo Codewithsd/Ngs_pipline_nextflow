@@ -1,0 +1,108 @@
+#!/usr/bin/env nextflow
+
+nextflow.enable.dsl=2
+
+// Define parameters (input files and tools)
+params.fastq_dir = './fastq'
+params.output_dir = './output'
+params.reference = './reference/genome.fa'
+params.threads = 8
+
+// Process 1: Quality Control with FastQC
+process qc_fastqc {
+
+    input:
+    path fastq_files from Channel.fromPath("${params.fastq_dir}/*.fastq.gz")
+    
+    output:
+    path "${params.output_dir}/fastqc"
+
+    script:
+    """
+    mkdir -p ${params.output_dir}/fastqc
+    fastqc -t ${params.threads} -o ${params.output_dir}/fastqc ${fastq_files}
+    """
+}
+
+// Process 2: Trimming with Trimmomatic
+process trim_reads {
+
+    input:
+    tuple path(r1), path(r2) from Channel
+        .fromPath("${params.fastq_dir}/*_R1.fastq.gz")
+        .set { fastqR1 }
+        .fromPath("${params.fastq_dir}/*_R2.fastq.gz")
+        .set { fastqR2 }
+        .combine(fastqR1, fastqR2)
+
+    output:
+    tuple path("${params.output_dir}/trimmed/*_R1_trimmed.fastq.gz"),
+          path("${params.output_dir}/trimmed/*_R2_trimmed.fastq.gz")
+
+    script:
+    """
+    mkdir -p ${params.output_dir}/trimmed
+    java -jar trimmomatic-0.39.jar PE \
+        -threads ${params.threads} ${r1} ${r2} \
+        ${params.output_dir}/trimmed/\$(basename ${r1} _R1.fastq.gz)_R1_trimmed.fastq.gz \
+        ${params.output_dir}/trimmed/\$(basename ${r1} _R1.fastq.gz)_R1_unpaired.fastq.gz \
+        ${params.output_dir}/trimmed/\$(basename ${r2} _R2.fastq.gz)_R2_trimmed.fastq.gz \
+        ${params.output_dir}/trimmed/\$(basename ${r2} _R2.fastq.gz)_R2_unpaired.fastq.gz \
+        ILLUMINACLIP:TruSeq3-PE.fa:2:30:10 LEADING:3 TRAILING:3 SLIDINGWINDOW:4:15 MINLEN:36
+    """
+}
+
+// Process 3: Alignment with BWA MEM
+process align_bwa {
+
+    input:
+    tuple path(r1), path(r2) from trim_reads.out
+
+    output:
+    path "${params.output_dir}/alignment/*.bam"
+
+    script:
+    """
+    mkdir -p ${params.output_dir}/alignment
+    bwa mem -t ${params.threads} ${params.reference} ${r1} ${r2} > ${params.output_dir}/alignment/\$(basename ${r1} _R1_trimmed.fastq.gz).sam
+    samtools view -@ ${params.threads} -bS ${params.output_dir}/alignment/\$(basename ${r1} _R1_trimmed.fastq.gz).sam \
+        > ${params.output_dir}/alignment/\$(basename ${r1} _R1_trimmed.fastq.gz).bam
+    samtools sort -@ ${params.threads} ${params.output_dir}/alignment/\$(basename ${r1} _R1_trimmed.fastq.gz).bam \
+        -o ${params.output_dir}/alignment/\$(basename ${r1} _R1_trimmed.fastq.gz)_sorted.bam
+    samtools index ${params.output_dir}/alignment/\$(basename ${r1} _R1_trimmed.fastq.gz)_sorted.bam
+    """
+}
+
+// Process 4: Variant Calling with GATK HaplotypeCaller
+process variant_calling {
+
+    input:
+    path bam_files from Channel.fromPath("${params.output_dir}/alignment/*_sorted.bam")
+
+    output:
+    path "${params.output_dir}/variants/*.vcf"
+
+    script:
+    """
+    mkdir -p ${params.output_dir}/variants
+    gatk HaplotypeCaller \
+        -R ${params.reference} \
+        -I ${bam_files} \
+        -O ${params.output_dir}/variants/\$(basename ${bam_files} _sorted.bam).vcf
+    """
+}
+
+// Define Workflow
+workflow {
+    // Step 1: Run FastQC for quality control
+    qc_fastqc()
+
+    // Step 2: Trim reads using Trimmomatic
+    trim_reads()
+
+    // Step 3: Align the reads to the reference genome using BWA MEM
+    align_bwa()
+
+    // Step 4: Perform variant calling with GATK
+    variant_calling()
+}
